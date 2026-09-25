@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-RISHANT X EXECUTOR — API VERSION
-Same logic as executor | Flask API | Guest Gen + Activator
+RISHANT X EXECUTOR — GUEST GEN + ACTIVATOR
+Simple | Fast | No Resume | No Batch Pause
 """
 
 import os, sys, json, time, random, string, hashlib, hmac, uuid, re, base64
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime, timezone
-
-from flask import Flask, request, jsonify
 
 import requests, urllib3
 from requests.adapters import HTTPAdapter
@@ -23,8 +21,16 @@ except ImportError:
     import blackboxprotobuf
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+if os.name == "nt":
+    os.system("chcp 65001 > nul")
 
-app = Flask(__name__)
+# ============================================================
+# COLORS
+# ============================================================
+class C:
+    RST="\033[0m"; B="\033[1m"; DIM="\033[2m"
+    RED="\033[91m"; GRN="\033[92m"; YEL="\033[93m"
+    CYA="\033[96m"; SILVER="\033[38;5;250m"; GREY="\033[38;5;245m"
 
 # ============================================================
 # URLS
@@ -35,6 +41,7 @@ URL_MAJOR_LOGIN    = "https://loginbp.ppmainecoonghj.com/MajorLogin"
 URL_MAJOR_REGISTER = "https://loginbp.ppmainecoonghj.com/MajorRegister"
 URL_NEWBIE_CHOICE  = "https://loginbp.ppmainecoonghj.com/ChooseNewbieChoice"
 
+# Activator URLs
 CLIENT_URLS = {
     "IND": "https://client.ind.freefiremobile.com/",
     "ID":  "https://clientbp.ggblueshark.com/",
@@ -112,14 +119,48 @@ DEVICES = [
 ]
 
 # ============================================================
+# CONFIG
+# ============================================================
+CONFIG = {
+    "target":        100,
+    "threads":       30,
+    "output_file":   "accounts.json",
+    "nick_prefix":   "FF",
+    "nick_max_len":  12,
+    "use_proxy":     True,
+    "proxy_file":    "working_proxies.txt",
+    "region":        "IND",
+    "activate":      True,     # ← NAYA: activation on/off
+}
+
+# ============================================================
 # GLOBALS
 # ============================================================
+ALL_ACCOUNTS = []
+FILE_LOCK    = threading.Lock()
+COUNTER_LOCK = threading.Lock()
+PRINT_LOCK   = threading.Lock()
+PROXY_LOCK   = threading.Lock()
+PACE_LOCK    = {}
+LAST_PACE    = {}
+
+TOTAL = 0
+ACTIVATED = 0       # ← NAYA
 PROXIES = []
 PROXY_COOLDOWN = {}
 CURRENT_PROXY = None
-PROXY_LOCK = threading.Lock()
-PACE_LOCK = {}
-LAST_PACE = {}
+
+# ============================================================
+# PRINT
+# ============================================================
+def out(m):
+    with PRINT_LOCK: print(m, flush=True)
+
+def ts(): return time.strftime("[%H:%M:%S]")
+def ok(m):   out(f"{ts()} {C.GRN}[+]{C.RST} {m}")
+def err(m):  out(f"{ts()} {C.RED}[x]{C.RST} {m}")
+def info(m): out(f"{ts()} {C.CYA}[*]{C.RST} {m}")
+def warn(m): out(f"{ts()} {C.YEL}[!]{C.RST} {m}")
 
 # ============================================================
 # PROXY
@@ -127,8 +168,13 @@ LAST_PACE = {}
 def load_proxies():
     global PROXIES, CURRENT_PROXY
     PROXIES = []
-    pf = "working_proxies.txt"
+    if not CONFIG["use_proxy"]:
+        PROXIES = [None]; CURRENT_PROXY = None
+        info("DIRECT mode (no proxy)")
+        return
+    pf = CONFIG["proxy_file"]
     if not os.path.exists(pf):
+        warn(f"No {pf} — DIRECT mode")
         PROXIES = [None]; CURRENT_PROXY = None
         return
     with open(pf, encoding="utf-8") as f:
@@ -140,6 +186,7 @@ def load_proxies():
         PROXIES = [None]; CURRENT_PROXY = None
     else:
         CURRENT_PROXY = PROXIES[0]
+        info(f"Loaded {len(PROXIES)} proxies")
 
 def _pk(p):
     if p is None: return "__direct__"
@@ -188,7 +235,9 @@ def gen_password():
 # ============================================================
 # NICKNAME
 # ============================================================
-def gen_nickname(prefix="FF", max_len=12):
+def gen_nickname():
+    prefix = CONFIG["nick_prefix"]
+    max_len = CONFIG["nick_max_len"]
     avail = max_len - len(prefix)
     if avail < 1:
         return prefix[:max_len].encode()
@@ -340,9 +389,10 @@ def _build_login_meta(open_id, access_token):
     }
 
 # ============================================================
-# ==============  ACTIVATOR  =================================
+# ==============  ACTIVATOR (NAYA ADD KIYA)  =================
 # ============================================================
 def _extract_jwt(resp_text):
+    """Response se JWT token nikalta hai"""
     try:
         idx = resp_text.find("eyJhbGci")
         if idx == -1:
@@ -356,6 +406,7 @@ def _extract_jwt(resp_text):
         return None
 
 def _build_final_payload(jwt, access_token):
+    """JWT decode karke GetLoginData ka final payload banata hai"""
     try:
         tp = jwt.split('.')[1]
         tp += '=' * ((4 - len(tp) % 4) % 4)
@@ -387,6 +438,7 @@ def _build_final_payload(jwt, access_token):
         return None
 
 def _get_login_data(jwt, payload, region, session, proxy):
+    """Final call — account ko fully active karta hai"""
     link = CLIENT_URLS.get(region.upper(), "https://clientbp.ggblueshark.com/")
     url = f"{link}GetLoginData"
 
@@ -413,12 +465,19 @@ def _get_login_data(jwt, payload, region, session, proxy):
     return None
 
 def activate_account(access_token, open_id, region, session, proxy):
+    """
+    Poora activation flow:
+    1. MajorLogin (proper payload) -> JWT
+    2. JWT decode -> final payload
+    3. GetLoginData -> full active
+    Returns: dict {jwt_token, status} ya None
+    """
     try:
         lang_map = {"IND":"hi","BD":"bn","PK":"ur","ID":"id","ME":"ar",
                     "TH":"th","VN":"vi","RU":"ru","TW":"zh","BR":"pt","SAC":"es"}
         lang = lang_map.get(region.upper(), "en")
 
-        # --- Step 1: MajorLogin ---
+        # --- Step 1: MajorLogin with proper payload ---
         payload_parts = [
             b'\x1a\x132025-08-30 05:19:21"\tfree fire(\x01:\x081.114.13B2Android OS 9 / API-28 (PI/rel.cjw.20220518.114133)J\x08HandheldR\nATM MobilsZ\x04WIFI`\xb6\nh\xee\x05r\x03300z\x1fARMv7 VFPv3 NEON VMH | 2400 | 2\x80\x01\xc9\x0f\x8a\x01\x0fAdreno (TM) 640\x92\x01\rOpenGL ES 3.2\x9a\x01+Google|dfa4ab4b-9dc4-454e-8065-e70c733fa53f\xa2\x01\x0e105.235.139.91\xaa\x01\x02',
             lang.encode("ascii"),
@@ -454,10 +513,12 @@ def activate_account(access_token, open_id, region, session, proxy):
         if r.status_code != 200 or len(r.text) < 10:
             return None
 
+        # --- Step 2: JWT extract ---
         jwt = _extract_jwt(r.text)
         if not jwt:
             return None
 
+        # --- Step 3: Final payload + GetLoginData ---
         final_payload = _build_final_payload(jwt, access_token)
         if not final_payload:
             return None
@@ -468,13 +529,28 @@ def activate_account(access_token, open_id, region, session, proxy):
 
         return {"jwt_token": jwt, "status": "full_login"}
 
-    except Exception:
+    except Exception as e:
         return None
 
 # ============================================================
-# REGISTER ONE (same as executor)
+# SAVE
 # ============================================================
-def register_one(worker_id, nick_prefix="FF", nick_max_len=12, region="IND", do_activate=True):
+def save_account(acc):
+    with FILE_LOCK:
+        ALL_ACCOUNTS.append(acc)
+        tmp = CONFIG["output_file"] + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(ALL_ACCOUNTS, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, CONFIG["output_file"])
+        except Exception as e:
+            err(f"save: {e}")
+
+# ============================================================
+# REGISTER
+# ============================================================
+def register_one(worker_id):
+    global TOTAL, ACTIVATED
     session = get_session()
     proxy = get_proxy()
 
@@ -520,7 +596,7 @@ def register_one(worker_id, nick_prefix="FF", nick_max_len=12, region="IND", do_
             access_token = gd["access_token"]
             open_id      = gd["open_id"]
 
-            # 3. MAJOR LOGIN #1
+            # 3. MAJOR LOGIN #1 (initial, ignore response)
             hdr = dict(HEADERS_LOGINBP)
             hdr["X-GA-SV"] = str(int(time.time()))
             login_meta = _build_login_meta(open_id, access_token)
@@ -532,7 +608,7 @@ def register_one(worker_id, nick_prefix="FF", nick_max_len=12, region="IND", do_
                 pass
 
             # 4. NICKNAME
-            nick = gen_nickname(nick_prefix, nick_max_len)
+            nick = gen_nickname()
 
             # 5. MAJOR REGISTER
             reg_msg = {
@@ -564,157 +640,218 @@ def register_one(worker_id, nick_prefix="FF", nick_max_len=12, region="IND", do_
             except Exception:
                 pass
 
-            # 7. ACTIVATOR
+            # ================================================
+            #  >>>  STEP 7: ACTIVATOR (NAYA)  <<<
+            # ================================================
             activated = None
-            if do_activate:
+            if CONFIG["activate"]:
                 activated = activate_account(access_token, open_id,
-                                             region, session, proxy)
+                                             CONFIG["region"], session, proxy)
+
+            with COUNTER_LOCK:
+                TOTAL += 1
+                idx = TOTAL
+                if activated:
+                    ACTIVATED += 1
 
             nick_str = nick.decode('utf-8', errors='ignore')
 
             if activated:
-                return {
+                acc = {
                     "uid":        str(uid),
                     "password":   str(password),
                     "name":       nick_str,
                     "account_id": str(account_id),
-                    "region":     region,
+                    "region":     CONFIG["region"],
                     "status":     "full_login",
                     "jwt_token":  activated.get("jwt_token", ""),
                 }
+                save_account(acc)
+                ok(f"[W{worker_id:02d}][{idx:05d}] ✓ ACTIVE uid={uid} acc={account_id} name={nick_str}")
             else:
-                return {
+                acc = {
                     "uid":        str(uid),
                     "password":   str(password),
                     "name":       nick_str,
                     "account_id": str(account_id),
-                    "region":     region,
+                    "region":     CONFIG["region"],
                     "status":     "registered",
                     "jwt_token":  "",
                 }
+                save_account(acc)
+                warn(f"[W{worker_id:02d}][{idx:05d}] ○ REG-ONLY uid={uid} acc={account_id} name={nick_str}")
+
+            return acc
 
         except requests.exceptions.Timeout:
+            warn(f"[W{worker_id:02d}] timeout ({attempt}/{MAX_RETRIES})")
             time.sleep(FAIL_WAIT)
         except requests.exceptions.ProxyError:
             cooldown(proxy, 30); proxy = get_proxy()
-        except Exception:
+        except Exception as e:
+            err(f"[W{worker_id:02d}] {str(e)[:100]}")
             time.sleep(FAIL_WAIT)
 
     return None
 
 # ============================================================
-# FLASK API ENDPOINTS
+# BATCH
 # ============================================================
-@app.route('/')
-def home():
-    return jsonify({
-        "name": "RISHANT X EXECUTOR API",
-        "version": "1.0",
-        "endpoints": {
-            "/gen": "Generate accounts. Params: count, threads, name, region, activate, max_len",
-            "/health": "Health check"
-        },
-        "regions": list(CLIENT_URLS.keys()),
-        "max_count": 50,
-        "max_threads": 50,
-    })
+def run_batch():
+    global TOTAL, ACTIVATED
+    target  = CONFIG["target"]
+    threads = CONFIG["threads"]
 
-@app.route('/health')
-def health():
-    return jsonify({"status": "healthy", "time": datetime.now().isoformat()})
+    info(f"Start: {target} acc | threads={threads} | prefix={CONFIG['nick_prefix']} | region={CONFIG['region']} | activate={CONFIG['activate']}")
+    start = time.time()
 
-@app.route('/gen', methods=['GET', 'POST'])
-def generate():
-    """
-    GET /gen?count=10&threads=10&name=FF&region=IND&activate=y&max_len=12
-    POST /gen  { "count": 10, "threads": 10, "name": "FF", "region": "IND", "activate": true, "max_len": 12 }
-    """
-    # ---- Parse params ----
-    if request.method == 'POST':
-        data = request.get_json(silent=True) or {}
-        args = {**request.args.to_dict(), **data}
-    else:
-        args = request.args.to_dict()
+    with ThreadPoolExecutor(max_workers=threads) as ex:
+        futures = set()
+        for i in range(min(threads, target)):
+            futures.add(ex.submit(register_one, i % threads + 1))
 
+        while futures:
+            done, futures = wait(futures, return_when=FIRST_COMPLETED)
+            for f in done:
+                try: f.result()
+                except Exception: pass
+
+            with COUNTER_LOCK:
+                done_n = TOTAL
+            remaining = target - done_n - len(futures)
+            if remaining > 0:
+                for _ in range(min(threads - len(futures), remaining)):
+                    futures.add(ex.submit(register_one, random.randint(1, threads)))
+            if done_n >= target:
+                break
+
+    dt = time.time() - start
+    rate = TOTAL / max(dt, 1) * 60
+    info(f"DONE | Total={TOTAL} | Activated={ACTIVATED} | Registered-only={TOTAL-ACTIVATED} | {dt:.0f}s | {rate:.1f} acc/min")
+
+# ============================================================
+# INPUT HELPERS
+# ============================================================
+def ask(prompt, default):
     try:
-        count = int(args.get('count', 1))
-        count = max(1, min(count, 50))
-    except Exception:
-        count = 1
+        v = input(f"  {C.CYA}{prompt} {C.RST}[{default}]: ").strip()
+        return v if v else str(default)
+    except (EOFError, KeyboardInterrupt):
+        return str(default)
 
+def ask_int(prompt, default, lo=1, hi=999999):
     try:
-        threads = int(args.get('threads', 5))
-        threads = max(1, min(threads, 50))
+        v = input(f"  {C.CYA}{prompt} {C.RST}[{default}]: ").strip()
+        if not v: return default
+        return max(lo, min(hi, int(v)))
     except Exception:
-        threads = 5
+        return default
 
-    nick_prefix = str(args.get('name', 'FF'))[:8] or 'FF'
-
+def ask_yn(prompt, default="y"):
     try:
-        max_len = int(args.get('max_len', 12))
-        max_len = max(4, min(max_len, 12))
+        v = input(f"  {C.CYA}{prompt} {C.RST}[{default}]: ").strip().lower()
+        if not v: return default in ("y","yes")
+        return v in ("y","yes")
     except Exception:
-        max_len = 12
+        return default in ("y","yes")
 
-    region = str(args.get('region', 'IND')).upper()
-    if region not in CLIENT_URLS:
-        region = "IND"
+# ============================================================
+# BANNER + MENU
+# ============================================================
+BANNER = r"""
+   ██████╗ ██╗███████╗██╗  ██╗ █████╗ ███╗   ██╗████████╗
+   ██╔══██╗██║██╔════╝██║  ██║██╔══██╗████╗  ██║╚══██╔══╝
+   ██████╔╝██║███████╗███████║███████║██╔██╗ ██║   ██║
+   ██╔══██╗██║╚════██║██╔══██║██╔══██║██║╚██╗██║   ██║
+   ██║  ██║██║███████║██║  ██║██║  ██║██║ ╚████║   ██║
+   ╚═╝  ╚═╝╚═╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝
+"""
 
-    activate_raw = args.get('activate', 'y')
-    if isinstance(activate_raw, bool):
-        do_activate = activate_raw
-    else:
-        do_activate = str(activate_raw).lower() in ('y', 'yes', 'true', '1', 'on')
+def show_banner():
+    os.system("cls" if os.name == "nt" else "clear")
+    print()
+    for ln in BANNER.split("\n"):
+        print(f"{C.SILVER}{C.B}{ln}{C.RST}")
+    print(f"{C.GREY}{'━'*62}{C.RST}")
+    print(f"{C.SILVER}{C.B}              RISHANT X EXECUTOR{C.RST}")
+    print(f"{C.GREY}{'━'*62}{C.RST}\n")
 
-    # ---- Load proxies (per request) ----
+def menu_generate():
+    show_banner()
+
+    CONFIG["target"] = ask_int("How many accounts?", 100, 1, 1000000)
+    CONFIG["threads"] = ask_int("Threads?", 30, 1, 200)
+    CONFIG["output_file"] = ask("Output file?", "accounts.json")
+
+    print(f"\n  {C.CYA}━━━ Nickname ━━━{C.RST}")
+    CONFIG["nick_prefix"] = ask("Custom name prefix?", "FF")
+    CONFIG["nick_max_len"] = ask_int("Max length (max 12)?", 12, 4, 12)
+
+    ex = gen_nickname().decode('utf-8', errors='ignore')
+    print(f"  {C.DIM}Example: {C.GREY}{ex}{C.RST}")
+
+    print(f"\n  {C.CYA}━━━ Activation ━━━{C.RST}")
+    CONFIG["activate"] = ask_yn("Activate accounts (full_login)?", "y")
+    if CONFIG["activate"]:
+        print(f"  {C.DIM}Regions: IND, BD, PK, ID, ME, TH, VN, RU, TW, BR, SAC{C.RST}")
+        CONFIG["region"] = ask("Region", "IND").upper()
+
+    print()
+    print(f"  {C.GREY}{'─'*62}{C.RST}")
+    print(f"  Accounts   : {C.SILVER}{CONFIG['target']}{C.RST}")
+    print(f"  Threads    : {C.SILVER}{CONFIG['threads']}{C.RST}")
+    print(f"  Output     : {C.SILVER}{CONFIG['output_file']}{C.RST}")
+    print(f"  Prefix     : {C.SILVER}{CONFIG['nick_prefix']}{C.RST}")
+    print(f"  Max Length : {C.SILVER}{CONFIG['nick_max_len']}{C.RST}")
+    print(f"  Activate   : {C.SILVER}{'YES' if CONFIG['activate'] else 'NO'}{C.RST}")
+    if CONFIG["activate"]:
+        print(f"  Region     : {C.SILVER}{CONFIG['region']}{C.RST}")
+    print(f"  Mode       : {C.SILVER}FRESH{C.RST}")
+    print(f"  {C.GREY}{'─'*62}{C.RST}\n")
+
+    if input(f"  {C.CYA}Start? (Y/n): {C.RST}").strip().lower() not in ("", "y", "yes"):
+        return
+
+    if os.path.exists(CONFIG["output_file"]):
+        try:
+            os.remove(CONFIG["output_file"])
+            info(f"Removed old {CONFIG['output_file']}")
+        except Exception as e:
+            warn(f"Could not remove: {e}")
+
+    ALL_ACCOUNTS.clear()
     load_proxies()
 
-    start = time.time()
-    results = []
-    full_login_count = 0
-    reg_only_count = 0
+    print()
+    try:
+        run_batch()
+    except KeyboardInterrupt:
+        warn("Interrupted")
 
-    # ---- Run with ThreadPoolExecutor ----
-    with ThreadPoolExecutor(max_workers=threads) as ex:
-        futures = {ex.submit(register_one, i + 1, nick_prefix, max_len, region, do_activate): i
-                   for i in range(count)}
-        for fut in as_completed(futures):
-            try:
-                r = fut.result()
-                if r:
-                    results.append(r)
-                    if r.get("status") == "full_login":
-                        full_login_count += 1
-                    else:
-                        reg_only_count += 1
-            except Exception:
-                pass
-
-    elapsed = round(time.time() - start, 2)
-    rate = round(len(results) / max(elapsed, 0.01) * 60, 1)
-
-    return jsonify({
-        "success": True,
-        "requested": count,
-        "created": len(results),
-        "full_login": full_login_count,
-        "registered_only": reg_only_count,
-        "threads": threads,
-        "region": region,
-        "activate": do_activate,
-        "elapsed_seconds": elapsed,
-        "rate_per_min": rate,
-        "accounts": results,
-    })
+    print()
+    ok(f"DONE — {TOTAL} total | {ACTIVATED} activated | {TOTAL-ACTIVATED} registered-only")
+    info(f"Saved to {CONFIG['output_file']}")
+    input(f"\n  {C.DIM}Press Enter...{C.RST}")
 
 # ============================================================
-# RUN
+# MAIN
 # ============================================================
-if __name__ == '__main__':
-    print("=" * 60)
-    print("  RISHANT X EXECUTOR — API SERVER")
-    print("=" * 60)
-    print("  GET  /gen?count=10&threads=10&name=FF&region=IND&activate=y")
-    print("  POST /gen   (JSON body same params)")
-    print("=" * 60)
-    app.run(host='0.0.0.0', port=3000, debug=False, threaded=True)
+def main():
+    while True:
+        show_banner()
+        print(f"  {C.GREY}[1]{C.RST} Generate + Activate Accounts")
+        print(f"  {C.GREY}[0]{C.RST} Exit")
+        print()
+        ch = input(f"  {C.CYA}Choose: {C.RST}").strip()
+        if ch == "1":
+            menu_generate()
+        elif ch == "0":
+            print(f"\n  {C.SILVER}Bye!{C.RST}\n")
+            break
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        sys.exit(0)
